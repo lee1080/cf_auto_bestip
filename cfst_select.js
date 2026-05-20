@@ -1,4 +1,4 @@
-// cron "0 23 * * 4" cfst_test.js, tag:CFST优选测速
+// cron "0 23 * * 4" cfst_select.js, tag:CFST优选测速
 function Env(name) { this.name = name; }
 const $ = new Env('CFST优选测速');
 const fs = require('fs');
@@ -8,114 +8,47 @@ const { spawn, exec } = require('child_process');
 const https = require('https');
 const http = require('http');
 
+const {
+  resolveDataDir,
+  loadEnvFromConfigTxtIfNeeded,
+  parseConfigShToEnv,
+  loadEnvFromQingLongConfigIfNeeded,
+  findBinaryRecursive,
+  findFileUpwards,
+  sendNotification,
+  cidrToIps,
+  expandCidrs,
+  extractValidIpv4Candidates,
+  spawnWithCleanOutput,
+} = require('./utils/shared');
+
+function getSelectDataPaths(dataRootDir = resolveDataDir()) {
+  const dataDir = path.join(dataRootDir, 'cfst_select');
+  return {
+    dataRootDir,
+    dataDir,
+    outputSpeedFile: path.join(dataDir, 'speed_results.txt'),
+    outputIpFile: path.join(dataDir, 'valid_ips.txt'),
+    outputPreferredIpFile: path.join(dataDir, 'preferred_ips.txt'),
+    tempIpFile: path.join(dataDir, 'ips.txt'),
+    resultCsvFile: path.join(dataDir, 'result.csv'),
+  };
+}
+
 // ================================
 // 本地目录约定
 // ================================
 
 const CONFIG_TXT_PATH = path.join(__dirname, 'config.txt');
-const DATA_DIR = resolveDataDir();
+const SELECT_DATA_PATHS = getSelectDataPaths();
+const DATA_DIR = SELECT_DATA_PATHS.dataDir;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { }
 
-function resolveDataDir() {
-  const envDir = process.env.LOCAL_DATA_DIR;
-  const resolved = envDir
-    ? path.isAbsolute(envDir) ? envDir : path.resolve(__dirname, envDir)
-    : path.join(__dirname, 'data');
-  try { fs.mkdirSync(resolved, { recursive: true }); } catch (e) { }
-  return resolved;
-}
-
-const OUTPUT_SPEED_FILE = path.join(DATA_DIR, 'cfst_speed_results.txt');
-const OUTPUT_IP_FILE = path.join(DATA_DIR, 'cfst_valid_ips.txt');
-const OUTPUT_PREFERRED_IP_FILE = path.join(DATA_DIR, 'cfst_preferred_ips.txt');
-const TEMP_IP_FILE = path.join(DATA_DIR, 'cfst_ips.txt');
-const RESULT_CSV_FILE = path.join(DATA_DIR, 'result.csv');
-
-// ================================
-// 兼容从 config.txt 自动加载变量
-// ================================
-
-function loadEnvFromConfigTxtIfNeeded(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  const raw = fs.readFileSync(filePath, 'utf8');
-  const lines = raw.split(/\r?\n/);
-  for (const line of lines) {
-    let trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    if (trimmed.startsWith('export ')) trimmed = trimmed.slice('export '.length).trim();
-    const idx = trimmed.indexOf('=');
-    if (idx <= 0) continue;
-    const key = trimmed.slice(0, idx).trim();
-    let value = trimmed.slice(idx + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (!process.env[key]) process.env[key] = value;
-  }
-}
-
-function parseConfigShToEnvIfNeeded(data) {
-  const lines = data.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('export ')) continue;
-
-    // export KEY="VALUE"
-    let m = trimmed.match(/^export\s+(\w+)="([^"]*)"$/);
-    if (m) {
-      const key = m[1];
-      const value = m[2];
-      if (!process.env[key]) process.env[key] = value;
-      continue;
-    }
-
-    // export KEY='VALUE'
-    m = trimmed.match(/^export\s+(\w+)='([^']*)'$/);
-    if (m) {
-      const key = m[1];
-      const value = m[2];
-      if (!process.env[key]) process.env[key] = value;
-      continue;
-    }
-
-    // export KEY=VALUE
-    m = trimmed.match(/^export\s+(\w+)=(.+)$/);
-    if (m) {
-      const key = m[1];
-      const rawValue = (m[2] || '').trim();
-      if (!process.env[key]) process.env[key] = rawValue;
-    }
-  }
-}
-
-function loadEnvFromQingLongConfigIfNeeded() {
-  const candidates = [
-    '/ql/data/config/config.json',
-    '/ql/config/config.json',
-    '/ql/data/config/config.sh'
-  ];
-  for (const fp of candidates) {
-    if (!fs.existsSync(fp)) continue;
-    try {
-      const raw = fs.readFileSync(fp, 'utf8');
-      if (fp.endsWith('.json')) {
-        const json = JSON.parse(raw);
-        if (json && typeof json === 'object') {
-          for (const [k, v] of Object.entries(json)) {
-            if (v === undefined || v === null) continue;
-            const str = String(v);
-            if (!process.env[k]) process.env[k] = str;
-          }
-        }
-      } else {
-        parseConfigShToEnvIfNeeded(raw);
-      }
-      console.log(`已加载青龙配置文件: ${fp}`);
-      return;
-    } catch (e) {
-      console.warn(`无法加载青龙配置 ${fp}: ${e.message}`);
-    }
-  }
-}
+const OUTPUT_SPEED_FILE = SELECT_DATA_PATHS.outputSpeedFile;
+const OUTPUT_IP_FILE = SELECT_DATA_PATHS.outputIpFile;
+const OUTPUT_PREFERRED_IP_FILE = SELECT_DATA_PATHS.outputPreferredIpFile;
+const TEMP_IP_FILE = SELECT_DATA_PATHS.tempIpFile;
+const RESULT_CSV_FILE = SELECT_DATA_PATHS.resultCsvFile;
 
 // 优先：青龙环境变量(天然优先) > 青龙 config -> 再用本目录 config.txt 补齐默认值
 loadEnvFromQingLongConfigIfNeeded();
@@ -129,19 +62,29 @@ const cfstCandidates = os.platform() === 'win32' ? ['CloudflareST.exe', 'cfst.ex
 let cfstExecutable = cfstCandidates[0];
 let CFST_PATH = path.join(__dirname, cfstExecutable);
 
-function findBinaryRecursive(dir, targetNames) {
-  const files = fs.readdirSync(dir);
-  for (const file of files) {
-    const fullPath = path.join(dir, file);
-    const stat = fs.statSync(fullPath);
-    if (stat.isDirectory()) {
-      const found = findBinaryRecursive(fullPath, targetNames);
-      if (found) return found;
-    } else if (targetNames.includes(file)) {
-      return fullPath;
-    }
+function getReleaseAssetPrefix(platform, arch) {
+  if (platform === 'linux') {
+    return `cfst_linux_${arch === 'arm64' ? 'arm64' : arch === 'arm' ? 'arm' : 'amd64'}`;
   }
-  return null;
+  if (platform === 'darwin') {
+    return `cfst_darwin_${arch === 'arm64' ? 'arm64' : 'amd64'}`;
+  }
+  if (platform === 'win32') {
+    return `cfst_windows_${arch === 'arm64' ? 'arm64' : arch === 'ia32' ? '386' : 'amd64'}`;
+  }
+  throw new Error(`不支持的操作系统: ${platform}`);
+}
+
+function normalizeLatencyTestConcurrency(rawValue) {
+  if (typeof rawValue === 'number' && Number.isInteger(rawValue)) {
+    return rawValue > 0 ? rawValue : 200;
+  }
+
+  const value = String(rawValue ?? '').trim();
+  if (!/^-?\d+$/.test(value)) return 200;
+
+  const parsed = Number.parseInt(value, 10);
+  return parsed > 0 ? parsed : 200;
 }
 
 async function downloadCFST() {
@@ -176,20 +119,7 @@ async function downloadCFST() {
     return { name: matched.name, url: matched.browser_download_url };
   }
 
-  let assetPrefix = '';
-  if (platform === 'linux') {
-    const archStr = arch === 'arm64' ? 'arm64' : (arch === 'arm' ? 'arm' : 'amd64');
-    assetPrefix = `cfst_linux_${archStr}`;
-  } else if (platform === 'darwin') {
-    const archStr = arch === 'arm64' ? 'arm64' : 'amd64';
-    assetPrefix = `cfst_darwin_${archStr}`;
-  } else if (platform === 'win32') {
-    const archStr = arch === 'arm64' ? 'arm64' : (arch === 'x32' ? '386' : 'amd64');
-    assetPrefix = `cfst_windows_${archStr}`;
-  } else {
-    throw new Error(`不支持的操作系统: ${platform}`);
-  }
-
+  const assetPrefix = getReleaseAssetPrefix(platform, arch);
   const latest = await fetchLatestReleaseAssetUrl(assetPrefix);
   fileName = latest.name;
   isZip = fileName.endsWith('.zip');
@@ -296,15 +226,15 @@ function loadConfig() {
   const config = {};
   const envConfig = {
     ip_source_url: process.env.IP_SOURCE_URL,
-    cfst_latency_threshold: process.env.CFST_LATENCY_THRESHOLD ? parseInt(process.env.CFST_LATENCY_THRESHOLD) : undefined,
-    speed_test_duration_s: process.env.SPEED_TEST_DURATION_S ? parseInt(process.env.SPEED_TEST_DURATION_S) : undefined,
-    download_speed_threshold_mbps: process.env.DOWNLOAD_SPEED_THRESHOLD_MBPS ? parseFloat(process.env.DOWNLOAD_SPEED_THRESHOLD_MBPS) : undefined,
+    cfst_select_latency_threshold: process.env.CFST_SELECT_LATENCY_THRESHOLD ? parseInt(process.env.CFST_SELECT_LATENCY_THRESHOLD) : undefined,
+    cfst_select_speed_test_duration_s: process.env.CFST_SELECT_SPEED_TEST_DURATION_S ? parseInt(process.env.CFST_SELECT_SPEED_TEST_DURATION_S) : undefined,
+    cfst_select_download_speed_threshold_mbps: process.env.CFST_SELECT_DOWNLOAD_SPEED_THRESHOLD_MBPS ? parseFloat(process.env.CFST_SELECT_DOWNLOAD_SPEED_THRESHOLD_MBPS) : undefined,
     preferred_ip_count: process.env.PREFERRED_IP_COUNT ? parseInt(process.env.PREFERRED_IP_COUNT) : undefined,
-    cfst_test_count: process.env.CFST_TEST_COUNT ? parseInt(process.env.CFST_TEST_COUNT) : undefined,
-    latency_test_concurrency: process.env.LATENCY_TEST_CONCURRENCY ? parseInt(process.env.LATENCY_TEST_CONCURRENCY) : undefined,
+    cfst_select_test_count: process.env.CFST_SELECT_TEST_COUNT ? parseInt(process.env.CFST_SELECT_TEST_COUNT) : undefined,
+    cfst_select_latency_test_concurrency: process.env.CFST_SELECT_LATENCY_TEST_CONCURRENCY ? parseInt(process.env.CFST_SELECT_LATENCY_TEST_CONCURRENCY) : undefined,
     ip_random_source_url: process.env.IP_RANDOM_SOURCE_URL,
     ip_random_sample_count: process.env.IP_RANDOM_SAMPLE_COUNT ? parseInt(process.env.IP_RANDOM_SAMPLE_COUNT) : undefined,
-    cfst_speed_test_url: process.env.CFST_SPEED_TEST_URL
+    cfst_select_speed_test_url: process.env.CFST_SELECT_SPEED_TEST_URL
   };
 
   // 兼容青龙 config.sh / config.json（保持原脚本能力）
@@ -339,15 +269,15 @@ function loadConfig() {
   };
 
   mergeConfig('ip_source_url', envConfig.ip_source_url, qlConfig.ip_source_url, null);
-  mergeConfig('latency_threshold_ms', envConfig.cfst_latency_threshold, qlConfig.cfst_latency_threshold, 500);
-  mergeConfig('speed_test_duration_s', envConfig.speed_test_duration_s, qlConfig.speed_test_duration_s, 10);
-  mergeConfig('download_speed_threshold_mbps', envConfig.download_speed_threshold_mbps, qlConfig.download_speed_threshold_mbps, 10);
-  mergeConfig('cfst_test_count', envConfig.cfst_test_count, qlConfig.cfst_test_count, 30);
+  mergeConfig('cfst_select_latency_threshold', envConfig.cfst_select_latency_threshold, qlConfig.cfst_select_latency_threshold, 500);
+  mergeConfig('cfst_select_speed_test_duration_s', envConfig.cfst_select_speed_test_duration_s, qlConfig.cfst_select_speed_test_duration_s, 10);
+  mergeConfig('cfst_select_download_speed_threshold_mbps', envConfig.cfst_select_download_speed_threshold_mbps, qlConfig.cfst_select_download_speed_threshold_mbps, 10);
+  mergeConfig('cfst_select_test_count', envConfig.cfst_select_test_count, qlConfig.cfst_select_test_count, 30);
   mergeConfig('preferred_ip_count', envConfig.preferred_ip_count, qlConfig.preferred_ip_count, 10);
-  mergeConfig('latency_test_concurrency', envConfig.latency_test_concurrency, qlConfig.latency_test_concurrency, 200);
+  mergeConfig('cfst_select_latency_test_concurrency', envConfig.cfst_select_latency_test_concurrency, qlConfig.cfst_select_latency_test_concurrency, 200);
   mergeConfig('ip_random_source_url', envConfig.ip_random_source_url, qlConfig.ip_random_source_url, null);
   mergeConfig('ip_random_sample_count', envConfig.ip_random_sample_count, qlConfig.ip_random_sample_count, 300);
-  mergeConfig('cfst_speed_test_url', envConfig.cfst_speed_test_url, qlConfig.cfst_speed_test_url, null);
+  mergeConfig('cfst_select_speed_test_url', envConfig.cfst_select_speed_test_url, qlConfig.cfst_select_speed_test_url, null);
 
   if (!config.ip_source_url && !config.ip_random_source_url) {
     console.error('错误: 请至少配置 IP_SOURCE_URL 或 IP_RANDOM_SOURCE_URL');
@@ -358,11 +288,11 @@ function loadConfig() {
 
 function displayConfig(config) {
   console.log(`数据目录: ${DATA_DIR}`);
-  console.log(`速度测试 URL: ${config.cfst_speed_test_url ? config.cfst_speed_test_url : '[使用 CloudflareST 默认地址]'}`);
-  console.log(`下载速度阈值: ${config.download_speed_threshold_mbps} MB/s`);
-  console.log(`延迟测试阈值: ${config.latency_threshold_ms} ms`);
-  console.log(`测速时长: ${config.speed_test_duration_s} s`);
-  console.log(`CFST 测速测试数量: ${config.cfst_test_count}`);
+  console.log(`速度测试 URL: ${config.cfst_select_speed_test_url ? config.cfst_select_speed_test_url : '[使用 CloudflareST 默认地址]'}`);
+  console.log(`下载速度阈值: ${config.cfst_select_download_speed_threshold_mbps} MB/s`);
+  console.log(`延迟测试阈值: ${config.cfst_select_latency_threshold} ms`);
+  console.log(`测速时长: ${config.cfst_select_speed_test_duration_s} s`);
+  console.log(`CFST 测速测试数量: ${config.cfst_select_test_count}`);
   console.log(`最终保存优选IP数量: ${config.preferred_ip_count}`);
 }
 
@@ -371,9 +301,10 @@ async function loadIpsFromUrl(urlString) {
     if (!urlString) return [];
     const sources = urlString.split(',').map(u => u.trim()).filter(Boolean);
     const allIps = new Set();
-    const ipRegex = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g;
 
-    const parseIpsFromText = (text) => text.match(ipRegex) || [];
+    const parseIpsFromText = (text) => expandCidrs(
+      extractValidIpv4Candidates(text).map(candidate => candidate.includes(':') ? candidate.split(':')[0] : candidate)
+    );
 
     for (const source of sources) {
       try {
@@ -452,36 +383,6 @@ async function saveResults(finalResults, preferredIpCount) {
   console.log(`- ${OUTPUT_PREFERRED_IP_FILE}`);
 }
 
-function findFileUpwards(filename, startDir) {
-  let currentDir = startDir || __dirname;
-  const root = path.parse(currentDir).root;
-  while (currentDir !== root) {
-    const fp = path.join(currentDir, filename);
-    if (fs.existsSync(fp)) return fp;
-    const parentDir = path.dirname(currentDir);
-    if (parentDir === currentDir) break;
-    currentDir = parentDir;
-  }
-  return null;
-}
-
-async function sendNotification(title, content) {
-  console.log(`\n准备发送通知 [${title}]...`);
-  try {
-    const sendNotifyPath = findFileUpwards('sendNotify.js');
-    if (sendNotifyPath) {
-      const notify = require(sendNotifyPath);
-      if (notify && typeof notify.sendNotify === 'function') {
-        await notify.sendNotify(title, content);
-        console.log('Node.js sendNotify.js 方式通知发送完毕。');
-        return;
-      }
-    }
-  } catch (e) {
-    console.warn(`通知模块调用失败: ${e.message}`);
-  }
-}
-
 // ================================
 // 主流程
 // ================================
@@ -540,28 +441,22 @@ async function main() {
 
   const cfstArgs = [
     '-f', TEMP_IP_FILE,
-    '-tl', config.latency_threshold_ms,
-    '-sl', config.download_speed_threshold_mbps,
-    '-dn', config.cfst_test_count || Math.max(config.preferred_ip_count, 10),
-    '-dt', config.speed_test_duration_s
+    '-tl', config.cfst_select_latency_threshold,
+    '-sl', config.cfst_select_download_speed_threshold_mbps,
+    '-dn', config.cfst_select_test_count || Math.max(config.preferred_ip_count, 10),
+    '-dt', config.cfst_select_speed_test_duration_s
   ];
 
-  if (config.cfst_speed_test_url) cfstArgs.push('-url', config.cfst_speed_test_url);
-  if (config.latency_test_concurrency && config.latency_test_concurrency > 12) cfstArgs.push('-n', config.latency_test_concurrency);
-  else cfstArgs.push('-n', 200);
+  if (config.cfst_select_speed_test_url) cfstArgs.push('-url', config.cfst_select_speed_test_url);
+  cfstArgs.push('-n', normalizeLatencyTestConcurrency(config.cfst_select_latency_test_concurrency));
 
   console.log(`\n============== 开始执行 CloudflareSpeedTest ==============`);
   console.log(`CMD: ${cfstExecutable} ${cfstArgs.join(' ')}\n`);
 
+  console.log('正在运行 CloudflareST，请稍候...');
   try {
-    await new Promise((resolve, reject) => {
-      const cfstProcess = spawn(CFST_PATH, cfstArgs, { stdio: 'inherit' });
-      cfstProcess.on('close', (code) => {
-        console.log(`\nCloudflareST 执行完毕，退出码: ${code}`);
-        resolve();
-      });
-      cfstProcess.on('error', (err) => reject(err));
-    });
+    const exitCode = await spawnWithCleanOutput(CFST_PATH, cfstArgs, { cwd: DATA_DIR });
+    console.log(`\nCloudflareST 执行完毕，退出码: ${exitCode}`);
   } catch (err) {
     console.error(`执行 CloudflareST 时出错: ${err.message}`);
     await sendNotification('CFST 测速异常', `执行 CloudflareST 失败: ${err.message}`);
@@ -599,8 +494,20 @@ async function main() {
   console.log('=== 脚本成功运行结束 ===');
 }
 
-main().catch(async error => {
-  console.error(`脚本全局错误: ${error.stack}`);
-  await sendNotification('CFST 脚本崩溃', error.message);
-});
+module.exports = {
+  getReleaseAssetPrefix,
+  getSelectDataPaths,
+  loadConfig,
+  main,
+  normalizeLatencyTestConcurrency,
+  parseCsvResults,
+  saveResults,
+};
+
+if (require.main === module) {
+  main().catch(async error => {
+    console.error(`脚本全局错误: ${error.stack}`);
+    await sendNotification('CFST 脚本崩溃', error.message);
+  });
+}
 

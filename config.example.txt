@@ -1,0 +1,131 @@
+# 说明：
+# - 这是项目默认提交的运行配置模板文件。
+# - 使用前请复制本文件为同目录 config.txt，再按需修改。
+# - config.txt 仅本地使用，且应保持 gitignore，勿提交（尤其敏感信息）。
+# - 脚本会优先读取环境变量；若环境变量缺失，会自动读取同目录的 config.txt。
+
+## ================================
+## CFST 自动测速（cfst_select.js）
+## ================================
+
+# 固定候选 IP 来源（可多个，支持 URL / 本地文件 / 单个 IP，逗号分隔）
+export IP_SOURCE_URL="https://ipdb.api.030101.xyz/?type=bestcf,https://ip.v2too.top/api/nodes,https://www.wetest.vip/api/cf2dns/get_cloudflare_ip?key=o1zrmHAF&type=v4,https://api.uouin.com/cloudflare.html"
+
+# 随机候选 IP 来源（可多个，支持 URL / 本地文件 / 单个 IP，逗号分隔）
+export IP_RANDOM_SOURCE_URL="https://www.cloudflare.com/ips-v4"
+
+# 随机采样数量（默认 300）
+export IP_RANDOM_SAMPLE_COUNT=10000
+
+# 下载速度门槛（MB/s，默认 10）
+export CFST_SELECT_DOWNLOAD_SPEED_THRESHOLD_MBPS=10
+
+# 每个节点测速持续时间（秒，默认 10）
+export CFST_SELECT_SPEED_TEST_DURATION_S=10
+
+# 最终保存优选 IP 数量（默认 10）
+export PREFERRED_IP_COUNT=10
+
+# CloudflareST 参与下载测速的候选数量（默认 30）
+export CFST_SELECT_TEST_COUNT=30
+
+# CloudflareST 延迟阈值（毫秒，默认 500）
+export CFST_SELECT_LATENCY_THRESHOLD=500
+
+# CloudflareST 自定义测速地址（可选）
+export CFST_SELECT_SPEED_TEST_URL=
+
+# CloudflareST 并发数（默认 200）
+export CFST_SELECT_LATENCY_TEST_CONCURRENCY=200
+
+# GitHub 加速代理地址（可选）
+export github_proxy=
+
+# 本地结果目录（默认 ./data）
+export LOCAL_DATA_DIR=./data
+
+
+## ================================
+## IP 同步（ip_sync.js）
+## ================================
+
+# 候选 IP 池：支持
+# - 直接 IP：1.1.1.1,8.8.8.8
+# - 远程 URL：http(s)://...
+# - 本地文件路径：./data/cfst_select/preferred_ips.txt 或 /abs/path/xxx.txt
+# 若留空，脚本默认读取 ./data/cfst_select/preferred_ips.txt
+export CF_IP_POOL="./data/cfst_select/preferred_ips.txt,https://ipdb.api.030101.xyz/?type=bestcf,https://ip.v2too.top/api/nodes,https://www.wetest.vip/api/cf2dns/get_cloudflare_ip?key=o1zrmHAF&type=v4,https://api.uouin.com/cloudflare.html"
+
+# Cloudflare API Token
+export CF_API_TOKEN=
+
+# Cloudflare Zone ID
+export CF_ZONE_ID=
+
+# 需要同步的完整子域名
+export CF_DOMAIN=
+
+# 更新模式：
+# - latency：对候选池全部 IP 做轻量探活，选择延迟最低的健康 IP
+# - speed：先轻量探活并剔除失败 IP，再只对延迟最低的前 MAX_IPS*3 个候选做 CloudflareST 下载测速
+# 其它值都会按 latency 处理
+export IP_UPDATE_MODE=latency
+
+# 未设置时回退到 CFST_SELECT_LATENCY_THRESHOLD（默认 500）
+export IP_SYNC_LATENCY_THRESHOLD=
+
+# 未设置时回退到 CFST_SELECT_TEST_COUNT（默认 30）
+export IP_SYNC_TEST_COUNT=
+
+# 未设置时回退到 CFST_SELECT_LATENCY_TEST_CONCURRENCY（默认 200）
+export IP_SYNC_LATENCY_TEST_CONCURRENCY=
+
+# 未设置时回退到 CFST_SELECT_DOWNLOAD_SPEED_THRESHOLD_MBPS（默认 10）
+export IP_SYNC_DOWNLOAD_SPEED_THRESHOLD_MBPS=
+
+# 若设置则直接传给 CloudflareST；未设置时才基于 CFST_SELECT_SPEED_TEST_DURATION_S 计算 max(3, floor(x/2))
+export IP_SYNC_SPEED_TEST_DURATION_S=
+
+# 未设置时回退到 CFST_SELECT_SPEED_TEST_URL
+export IP_SYNC_SPEED_TEST_URL=
+
+# 若设置则直接作为 speed 模式二阶段候选数量；未设置时才按 MAX_IPS*3 计算
+export IP_SYNC_SPEED_CANDIDATE_COUNT=
+
+# 最终保留在 DNS 解析中的健康 IP 数量（默认 2）
+export MAX_IPS=2
+
+# 告警阈值（健康 IP <= 该值 且不足 MAX_IPS 时触发）
+export NOTIFY_THRESHOLD=2
+
+# GitHub Token（与 GIST_NAME 同时存在时启用 Gist 同步）
+export GITHUB_TOKEN=
+
+# Gist 文件名（例如 cf_ips.txt）
+export GIST_NAME=
+
+# 是否创建 secret gist（仅 true 视为 secret；否则为 public）
+export GIST_SECRET=false
+
+# 首次创建后返回的 gist id 会自动保存到 ./data/ip_sync/gist_id.txt
+
+# S3 兼容对象存储 Endpoint（R2 示例: https://<account_id>.r2.cloudflarestorage.com）
+export S3_ENDPOINT=
+
+# S3 签名 Region（R2 一般填 auto）
+export S3_REGION=
+
+# S3 Bucket 名称
+export S3_BUCKET=
+
+# S3 对象 key（例如 best-ip.txt 或 ips/best-ip.txt）
+export S3_KEY=
+
+# S3 Access Key ID
+export S3_ACCESS_KEY_ID=
+
+# S3 Secret Access Key
+export S3_SECRET_ACCESS_KEY=
+
+# 是否允许明文 HTTP Endpoint（仅本地调试 MinIO 等场景才设为 true）
+export S3_ALLOW_HTTP=false

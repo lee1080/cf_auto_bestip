@@ -2,6 +2,9 @@
 data/
 *.log
 
+# Local config
+config.txt
+
 # OS / editor files
 .DS_Store
 Thumbs.db
