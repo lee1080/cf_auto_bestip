@@ -68,8 +68,12 @@ export CF_DOMAIN=
 # 更新模式：
 # - latency：对候选池全部 IP 做轻量探活，选择延迟最低的健康 IP
 # - speed：先轻量探活并剔除失败 IP，再只对延迟最低的前 MAX_IPS*3 个候选做 CloudflareST 下载测速
-# 其它值都会按 latency 处理
-export IP_UPDATE_MODE=latency
+# - stable：稳定模式。每次加载 CF_IP_POOL（远程 URL 重试 3 次）；
+#           在岗 IP 优先读 ./data/ip_sync/serving_ips.txt（与 DNS 同步缓存，减少 CF API 调用），
+#           本地缓存为空时再用 Cloudflare DNS 兜底；不在候选池的在岗 IP 淘汰，不足 MAX_IPS 时从候选池探活补位；
+#           最终 IP 与 serving_ips.txt / DNS 一致则跳过 DNS 更新；每次成功同步后会写回 serving_ips.txt
+# 未设置或其它非法值时默认 stable
+export IP_UPDATE_MODE=stable
 
 # 未设置时回退到 CFST_SELECT_LATENCY_THRESHOLD（默认 500）
 export IP_SYNC_LATENCY_THRESHOLD=

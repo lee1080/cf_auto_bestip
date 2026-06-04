@@ -41,7 +41,7 @@ function getSyncDataPaths(dataRootDir = resolveDataDir()) {
     dataRootDir,
     dataDir,
     defaultPoolFile: path.join(dataRootDir, "cfst_select", "preferred_ips.txt"),
-    preferredOutputFile: path.join(dataDir, "preferred_ips.txt"),
+    servingIpsFile: path.join(dataDir, "serving_ips.txt"),
     gistIdStateFile: path.join(dataDir, "gist_id.txt"),
     inputFilePath: path.join(dataDir, "ips.txt"),
     resultCsvPath: path.join(dataDir, "result.csv"),
@@ -53,7 +53,7 @@ function ensureDataDir(dirPath) {
   return dirPath;
 }
 
-function ensurePreferredOutputFile(filePath = PREFERRED_OUTPUT_FILE) {
+function ensureServingIpsFile(filePath = SERVING_IPS_FILE) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, "", "utf8");
@@ -61,7 +61,7 @@ function ensurePreferredOutputFile(filePath = PREFERRED_OUTPUT_FILE) {
   return filePath;
 }
 
-function writePreferredOutputFile(ips, filePath = PREFERRED_OUTPUT_FILE) {
+function writeServingIpsFile(ips, filePath = SERVING_IPS_FILE) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${ips.join("\n")}\n`, "utf8");
   return filePath;
@@ -80,7 +80,7 @@ loadEnvFromConfigTxtIfNeeded(CONFIG_TXT_PATH);
 const SYNC_DATA_PATHS = getSyncDataPaths();
 const DATA_DIR = ensureDataDir(SYNC_DATA_PATHS.dataDir);
 const DEFAULT_POOL_FILE = SYNC_DATA_PATHS.defaultPoolFile;
-const PREFERRED_OUTPUT_FILE = SYNC_DATA_PATHS.preferredOutputFile;
+const SERVING_IPS_FILE = SYNC_DATA_PATHS.servingIpsFile;
 const GIST_ID_STATE_FILE = SYNC_DATA_PATHS.gistIdStateFile;
 const CFST_CANDIDATES =
   os.platform() === "win32"
@@ -89,7 +89,13 @@ const CFST_CANDIDATES =
 
 // --- 配置区域 (优先从环境变量读取) ---
 function normalizeIpUpdateMode(rawMode) {
-  return rawMode === "speed" ? "speed" : "latency";
+  const mode = String(rawMode || "")
+    .trim()
+    .toLowerCase();
+  if (mode === "speed") return "speed";
+  if (mode === "latency") return "latency";
+  if (mode === "stable") return "stable";
+  return "stable";
 }
 
 function parseBooleanEnv(rawValue) {
@@ -232,11 +238,61 @@ function formatSpeedSelectionSummary(selection) {
   ];
 }
 
+function formatStableSelectionSummary(selection) {
+  const lines = [
+    `📡 稳定模式 | 在岗来源: ${selection.currentSource}`,
+  ];
+
+  if (selection.prunedOutIps && selection.prunedOutIps.length > 0) {
+    lines.push(
+      `🔄 已淘汰不在候选池的在岗 IP: ${selection.prunedOutIps.join(", ")}`,
+    );
+  }
+
+  if (selection.currentProbeResults.length > 0) {
+    lines.push("📊 候选池内在岗 IP 探活:");
+    for (const result of selection.currentProbeResults) {
+      lines.push(
+        result.success
+          ? `   - ${result.ip} | ${result.latency} ms`
+          : `   - ${result.ip} | ${result.reason || "failed"}`,
+      );
+    }
+  }
+
+  if (selection.skipDnsUpdate) {
+    lines.push("✅ 最终 IP 与 Cloudflare DNS 一致，跳过 DNS 更新");
+  } else {
+    if (selection.poolProbeResults.length > 0) {
+      lines.push("📊 候选池补位探测:");
+      for (const result of selection.poolProbeResults) {
+        lines.push(
+          result.success
+            ? `   - ${result.ip} | ${result.latency} ms`
+            : `   - ${result.ip} | ${result.reason || "failed"}`,
+        );
+      }
+    }
+    if (selection.replacements.length > 0) {
+      lines.push("✅ 补位上岗 IP:");
+      for (const result of selection.replacements) {
+        lines.push(`   - ${result.ip} | ${result.latency} ms`);
+      }
+    }
+  }
+
+  return lines;
+}
+
 function formatSelectionOutput(selection) {
-  const summaryLines =
-    selection.mode === "speed"
-      ? formatSpeedSelectionSummary(selection)
-      : formatLatencySelectionSummary(selection);
+  let summaryLines;
+  if (selection.mode === "speed") {
+    summaryLines = formatSpeedSelectionSummary(selection);
+  } else if (selection.mode === "stable") {
+    summaryLines = formatStableSelectionSummary(selection);
+  } else {
+    summaryLines = formatLatencySelectionSummary(selection);
+  }
 
   return [
     ...summaryLines,
@@ -501,28 +557,50 @@ function parseIpsFromText(text) {
   );
 }
 
-function fetchIpsFromUrl(url) {
+function fetchIpsFromUrl(url, options = {}) {
+  const maxAttempts = Math.max(1, options.retries ?? 1);
+  const retryDelayMs = options.retryDelayMs ?? 2000;
+
   return new Promise((resolve) => {
     const client = url.startsWith("https") ? https : http;
-    client
-      .get(url, { timeout: 10000 }, (res) => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          console.warn(`  ⚠️ 获取 ${url} 失败，HTTP ${res.statusCode}`);
-          resolve([]);
-          return;
-        }
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          const ips = parseIpsFromText(data);
-          console.log(`   ✅ 远程 URL: ${url} -> ${ips.length} 个 IP`);
-          resolve(ips);
+
+    function attempt(tryIndex) {
+      client
+        .get(url, { timeout: 10000 }, (res) => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            console.warn(
+              `  ⚠️ 获取 ${url} 失败，HTTP ${res.statusCode} (${tryIndex}/${maxAttempts})`,
+            );
+            scheduleRetry(tryIndex);
+            return;
+          }
+          let data = "";
+          res.on("data", (chunk) => (data += chunk));
+          res.on("end", () => {
+            const ips = parseIpsFromText(data);
+            console.log(
+              `   ✅ 远程 URL: ${url} -> ${ips.length} 个 IP (${tryIndex}/${maxAttempts})`,
+            );
+            resolve(ips);
+          });
+        })
+        .on("error", (e) => {
+          console.warn(
+            `  ⚠️ 获取 ${url} 出错: ${e.message} (${tryIndex}/${maxAttempts})`,
+          );
+          scheduleRetry(tryIndex);
         });
-      })
-      .on("error", (e) => {
-        console.warn(`  ⚠️ 获取 ${url} 出错: ${e.message}`);
-        resolve([]);
-      });
+    }
+
+    function scheduleRetry(tryIndex) {
+      if (tryIndex < maxAttempts) {
+        setTimeout(() => attempt(tryIndex + 1), retryDelayMs);
+        return;
+      }
+      resolve([]);
+    }
+
+    attempt(1);
   });
 }
 
@@ -560,7 +638,7 @@ function resolvePoolFilePath(item) {
   return path.isAbsolute(item) ? item : path.resolve(__dirname, item);
 }
 
-async function parseIpPool(poolStr) {
+async function parseIpPool(poolStr, options = {}) {
   const str = poolStr && poolStr.trim() ? poolStr.trim() : DEFAULT_POOL_FILE;
   const items = str
     .split(",")
@@ -601,8 +679,12 @@ async function parseIpPool(poolStr) {
     }),
   );
 
+  const fetchOptions = {
+    retries: options.remoteRetry ?? 1,
+    retryDelayMs: options.remoteRetryDelayMs ?? 2000,
+  };
   const remoteResults = await Promise.all(
-    urlItems.map((url) => fetchIpsFromUrl(url)),
+    urlItems.map((url) => fetchIpsFromUrl(url, fetchOptions)),
   );
   const remoteIps = remoteResults.flat();
   const localIps = fileItems.flatMap((fp) => readIpsFromLocalFile(fp));
@@ -718,7 +800,10 @@ async function cfApiRequest(method, apiPath, data = null) {
         try {
           const json = JSON.parse(body);
           if (json.success) resolve(json.result);
-          else reject(new Error(JSON.stringify(json.errors)));
+          else {
+            const detail = formatCfApiError(json);
+            reject(new Error(detail));
+          }
         } catch (e) {
           reject(new Error(`解析响应失败: ${e.message}`));
         }
@@ -729,6 +814,21 @@ async function cfApiRequest(method, apiPath, data = null) {
     if (data) req.write(JSON.stringify(data));
     req.end();
   });
+}
+
+function formatCfApiError(json) {
+  if (Array.isArray(json.errors) && json.errors.length > 0) {
+    return json.errors
+      .map((item) => item.message || JSON.stringify(item))
+      .join("; ");
+  }
+  if (Array.isArray(json.messages) && json.messages.length > 0) {
+    return json.messages
+      .map((item) => item.message || JSON.stringify(item))
+      .join("; ");
+  }
+  if (json.message) return String(json.message);
+  return "Cloudflare API 请求失败 (success=false)";
 }
 
 function githubApiRequest(method, apiPath, token, data = null) {
@@ -892,6 +992,211 @@ async function selectIpsByLatency(poolIps, config, deps = {}) {
   );
 
   return buildLatencySelection(results, config.MAX_IPS);
+}
+
+function getProbeConcurrency(config) {
+  return Number.isInteger(config.IP_SYNC_LATENCY_TEST_CONCURRENCY) &&
+    config.IP_SYNC_LATENCY_TEST_CONCURRENCY > 0
+    ? config.IP_SYNC_LATENCY_TEST_CONCURRENCY
+    : 200;
+}
+
+function sameIpSet(ipsA, ipsB) {
+  if (ipsA.length !== ipsB.length) return false;
+  const sortedA = [...ipsA].sort();
+  const sortedB = [...ipsB].sort();
+  return sortedA.every((ip, index) => ip === sortedB[index]);
+}
+
+async function resolveStableServingIps(config, deps = {}) {
+  const syncDataPaths = deps.syncDataPaths || SYNC_DATA_PATHS;
+  const localDnsCacheFile = syncDataPaths.servingIpsFile;
+
+  if (fs.existsSync(localDnsCacheFile)) {
+    const ips = Array.from(new Set(readIpsFromLocalFile(localDnsCacheFile)));
+    if (ips.length > 0) {
+      return { ips, source: "serving_ips_file" };
+    }
+  }
+
+  const missingDns = getMissingCloudflareOutputConfig(config);
+  if (missingDns.length === 0) {
+    try {
+      const fetchDns = deps.fetchCurrentDnsRecords || fetchCurrentDnsRecords;
+      const apiRequest = deps.cfApiRequest || cfApiRequest;
+      const records = await fetchDns(config, apiRequest);
+      if (!Array.isArray(records)) {
+        throw new Error("Cloudflare DNS 响应格式异常");
+      }
+      const ips = Array.from(
+        new Set(records.map((record) => record.content).filter(Boolean)),
+      );
+      return { ips, source: "cloudflare_dns" };
+    } catch (error) {
+      console.warn(
+        `⚠️ 稳定模式: 本地缓存为空且 CF DNS 读取失败 (${error.message})`,
+      );
+    }
+  }
+
+  return { ips: [], source: "none" };
+}
+
+async function fetchCurrentDnsIps(config, deps = {}) {
+  if (getMissingCloudflareOutputConfig(config).length > 0) return null;
+  try {
+    const fetchDns = deps.fetchCurrentDnsRecords || fetchCurrentDnsRecords;
+    const apiRequest = deps.cfApiRequest || cfApiRequest;
+    const records = await fetchDns(config, apiRequest);
+    if (!Array.isArray(records)) return null;
+    return Array.from(
+      new Set(records.map((record) => record.content).filter(Boolean)),
+    );
+  } catch (error) {
+    console.warn(`⚠️ 稳定模式: 读取 Cloudflare DNS 用于对比失败 (${error.message})`);
+    return null;
+  }
+}
+
+function buildStableSelectionBase(fields) {
+  return {
+    mode: "stable",
+    poolIps: [],
+    poolLoaded: false,
+    rawServingIps: [],
+    prunedOutIps: [],
+    alignedServingIps: [],
+    currentProbeResults: [],
+    poolProbeResults: [],
+    replacements: [],
+    finalResults: [],
+    finalHealthyIps: [],
+    dnsIps: null,
+    ...fields,
+  };
+}
+
+async function selectIpsByStable(poolStr, config, deps = {}) {
+  const loadPool = deps.parseIpPool || parseIpPool;
+  const probe = deps.testIp || testIp;
+  const probeConcurrency = getProbeConcurrency(config);
+
+  console.log(
+    "ℹ️ 稳定模式: 加载 CF_IP_POOL（远程 URL 最多重试 3 次）...",
+  );
+  const poolIps = await loadPool(poolStr, {
+    remoteRetry: 3,
+    remoteRetryDelayMs: 2000,
+  });
+
+  if (poolIps.length === 0) {
+    console.warn("⚠️ 稳定模式: CF_IP_POOL 为空");
+    return buildStableSelectionBase({
+      poolLoaded: true,
+      poolLoadFailed: true,
+    });
+  }
+
+  const poolSet = new Set(poolIps);
+  const { ips: rawServingIps, source: currentSource } =
+    await resolveStableServingIps(config, deps);
+
+  console.log(
+    `📡 稳定模式: 在岗 IP ${rawServingIps.length} 个 (来源: ${currentSource})`,
+  );
+
+  const prunedOutIps = rawServingIps.filter((ip) => !poolSet.has(ip));
+  const alignedServingIps = rawServingIps.filter((ip) => poolSet.has(ip));
+
+  if (prunedOutIps.length > 0) {
+    console.log(
+      `🔄 稳定模式: ${prunedOutIps.length} 个在岗 IP 不在候选池中，将淘汰: ${prunedOutIps.join(", ")}`,
+    );
+  }
+
+  const currentProbeResults =
+    alignedServingIps.length === 0
+      ? []
+      : await mapWithConcurrencyLimit(
+          alignedServingIps,
+          probeConcurrency,
+          (ip) => probe(ip),
+        );
+
+  const healthyServing = sortHealthyEntries(currentProbeResults);
+  const needCount = Math.max(0, config.MAX_IPS - healthyServing.length);
+  let poolProbeResults = [];
+  let replacements = [];
+
+  if (needCount > 0) {
+    const occupied = new Set(healthyServing.map((result) => result.ip));
+    const poolToProbe = poolIps.filter((ip) => !occupied.has(ip));
+
+    if (poolToProbe.length === 0) {
+      console.warn(
+        "⚠️ 稳定模式: 候选池中没有可用于补位的 IP（可能均已在岗或池过小）",
+      );
+    } else {
+      console.log(
+        `ℹ️ 稳定模式: 从候选池探活补位 ${needCount} 个 IP（待测 ${poolToProbe.length} 个）...`,
+      );
+      poolProbeResults = await mapWithConcurrencyLimit(
+        poolToProbe,
+        probeConcurrency,
+        (ip) => probe(ip),
+      );
+      replacements = sortHealthyEntries(poolProbeResults).slice(0, needCount);
+    }
+  }
+
+  const finalResults = [...healthyServing, ...replacements].slice(
+    0,
+    config.MAX_IPS,
+  );
+  const finalHealthyIps = finalResults.map((result) => result.ip);
+
+  // 优先用本地缓存（ip_sync/serving_ips.txt）判断是否与当前解析一致，避免重复调用 CF API
+  let referenceDnsIps = null;
+  if (
+    currentSource === "serving_ips_file" ||
+    currentSource === "cloudflare_dns"
+  ) {
+    referenceDnsIps = rawServingIps;
+  } else {
+    referenceDnsIps = await fetchCurrentDnsIps(config, deps);
+  }
+
+  const skipDnsUpdate =
+    referenceDnsIps !== null && sameIpSet(finalHealthyIps, referenceDnsIps);
+
+  if (skipDnsUpdate) {
+    console.log(
+      currentSource === "serving_ips_file"
+        ? "✅ 稳定模式: 最终 IP 与 serving_ips.txt 一致，跳过 DNS 更新"
+        : "✅ 稳定模式: 最终 IP 与 Cloudflare DNS 一致，跳过 DNS 更新",
+    );
+  } else if (referenceDnsIps !== null) {
+    console.log(
+      `ℹ️ 稳定模式: DNS 将更新 | 当前 [${referenceDnsIps.join(", ")}] -> 目标 [${finalHealthyIps.join(", ")}]`,
+    );
+  }
+
+  return buildStableSelectionBase({
+    skipDnsUpdate,
+    currentSource,
+    rawServingIps,
+    prunedOutIps,
+    alignedServingIps,
+    currentIps: alignedServingIps,
+    currentProbeResults,
+    poolIps,
+    poolLoaded: true,
+    poolProbeResults,
+    replacements,
+    finalResults,
+    finalHealthyIps,
+    dnsIps: referenceDnsIps,
+  });
 }
 
 function buildSpeedSelection(results, maxIps) {
@@ -1166,21 +1471,34 @@ async function runSync(config = loadRuntimeConfig(), deps = {}) {
   const loadPool = deps.parseIpPool || parseIpPool;
   const pickByLatency = deps.selectIpsByLatency || selectIpsByLatency;
   const pickBySpeed = deps.selectIpsBySpeed || selectIpsBySpeed;
+  const pickByStable = deps.selectIpsByStable || selectIpsByStable;
   const notify = deps.sendNotification || sendNotification;
   const writeOutputs = deps.syncOutputs || syncOutputs;
   const syncDataPaths = deps.syncDataPaths || SYNC_DATA_PATHS;
 
-  ensurePreferredOutputFile(syncDataPaths.preferredOutputFile);
+  ensureServingIpsFile(syncDataPaths.servingIpsFile);
 
-  const poolIps = await loadPool(config.CF_IP_POOL);
-  if (poolIps.length === 0) {
-    throw new Error("IP 池为空，无法继续同步");
+  let poolIps;
+  let selection;
+
+  if (config.IP_UPDATE_MODE === "stable") {
+    selection = await pickByStable(config.CF_IP_POOL, config, {
+      ...deps,
+      syncDataPaths,
+    });
+    poolIps = selection.poolIps || [];
+  } else {
+    poolIps = await loadPool(config.CF_IP_POOL);
+    if (poolIps.length === 0) {
+      throw new Error("IP 池为空，无法继续同步");
+    }
+
+    if (config.IP_UPDATE_MODE === "speed") {
+      selection = await pickBySpeed(poolIps, config, deps);
+    } else {
+      selection = await pickByLatency(poolIps, config, deps);
+    }
   }
-
-  const selection =
-    config.IP_UPDATE_MODE === "speed"
-      ? await pickBySpeed(poolIps, config, deps)
-      : await pickByLatency(poolIps, config, deps);
   const finalHealthyIps = selection.finalHealthyIps;
 
   if (finalHealthyIps.length === 0) {
@@ -1203,7 +1521,65 @@ async function runSync(config = loadRuntimeConfig(), deps = {}) {
     );
   }
 
-  writePreferredOutputFile(finalHealthyIps, syncDataPaths.preferredOutputFile);
+  writeServingIpsFile(finalHealthyIps, syncDataPaths.servingIpsFile);
+
+  if (selection.skipDnsUpdate) {
+    console.log("ℹ️ 稳定模式: 最终 IP 与 Cloudflare DNS 一致，跳过 DNS 同步");
+    const outputs = buildOutputStates(config);
+    const gistMissing = outputs.gist.missingConfig;
+    const s3Missing = outputs.s3.missingConfig;
+    const sideOutputs = [];
+
+    if (gistMissing.length === 0) {
+      sideOutputs.push(
+        runOutputAdapter({
+          missingConfig: [],
+          extras: { filename: config.GIST_NAME },
+          execute: async () =>
+            (deps.syncGistIpList || syncGistIpList)(
+              config,
+              finalHealthyIps,
+              deps.gistDeps || {},
+            ),
+        }).then((output) => {
+          outputs.gist = output;
+        }),
+      );
+    }
+
+    if (s3Missing.length === 0) {
+      sideOutputs.push(
+        runOutputAdapter({
+          missingConfig: [],
+          extras: {
+            bucket: config.S3_BUCKET,
+            key: config.S3_KEY,
+          },
+          execute: async () =>
+            (deps.syncS3IpList || syncS3IpList)(
+              config,
+              finalHealthyIps,
+              deps.s3Deps || {},
+            ),
+        }).then((output) => {
+          outputs.s3 = output;
+        }),
+      );
+    }
+
+    await Promise.all(sideOutputs);
+    const summaries = [
+      "ℹ️ Cloudflare DNS: 稳定模式跳过（最终 IP 与当前 DNS 一致）",
+      formatGistOutputSummary(outputs.gist),
+      formatS3OutputSummary(outputs.s3),
+    ];
+    for (const summary of summaries) {
+      if (summary) console.log(summary);
+    }
+
+    return { poolIps, selection, finalHealthyIps, outputs };
+  }
+
   const outputs = await writeOutputs(config, finalHealthyIps, deps);
   return { poolIps, selection, finalHealthyIps, outputs };
 }
@@ -1223,14 +1599,20 @@ module.exports = {
   getSyncDataPaths,
   buildS3PutObjectRequest,
   fetchCurrentDnsRecords,
+  formatCfApiError,
   formatDnsOutputSummary,
   formatGistIpContent,
   formatGistOutputSummary,
   formatInputSourceSummary,
   formatLatencySelectionSummary,
+  formatStableSelectionSummary,
   formatS3OutputSummary,
   formatSelectionOutput,
   formatSpeedSelectionSummary,
+  getProbeConcurrency,
+  resolveStableServingIps,
+  fetchCurrentDnsIps,
+  sameIpSet,
   getMissingCloudflareOutputConfig,
   getMissingGistOutputConfig,
   getMissingS3OutputConfig,
@@ -1246,6 +1628,7 @@ module.exports = {
   readGistIdStateFile,
   runSync,
   selectIpsByLatency,
+  selectIpsByStable,
   selectIpsBySpeed,
   syncGistIpList,
   syncOutputs,
@@ -1255,7 +1638,9 @@ module.exports = {
 
 if (require.main === module) {
   main().catch((err) => {
-    console.error(`\n❌ 脚本全局错误: ${err.message}`);
-    sendNotification("❌ CF IP 同步脚本崩溃", err.message);
+    const detail = err?.message || String(err) || "未知错误";
+    console.error(`\n❌ 脚本全局错误: ${detail}`);
+    if (err?.stack) console.error(err.stack);
+    sendNotification("❌ CF IP 同步脚本崩溃", detail);
   });
 }

@@ -5,7 +5,11 @@ data/
 # Local config
 config.txt
 
+# Private inject (QingLong / getfile upload)
+inject/
+
 # OS / editor files
 .DS_Store
 Thumbs.db
+cf_auto_bestip.code-workspace
 

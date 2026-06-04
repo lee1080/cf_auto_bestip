@@ -45,6 +45,7 @@
 - 📚 从 IP 池读取候选（支持 URL、本地文件、直接 IP）
 - ⚖️ `latency` 模式：对池内全部 IP 做轻量延迟/可用性探测
 - 🚀 `speed` 模式：先做轻量探活，再仅对延迟最低的少量候选复用本地 CloudflareST 二进制测速
+- 🛡️ `stable` 模式：每次加载 `CF_IP_POOL`；在岗 IP 优先 `data/ip_sync/serving_ips.txt`（与 DNS 同步缓存），否则读 CF DNS；淘汰不在池内的 IP 后探活补位；成功运行后写回该文件
 - ☁️ 可选同步 Cloudflare DNS 解析记录（A 记录）
 - 📝 可选同步最终 IP 列表到 Gist
 - 📦 可选上传最终 IP 列表到 S3/R2 兼容对象存储
@@ -94,7 +95,7 @@
 ### `ip_sync.js` 常用变量
 
 - `CF_IP_POOL`：IP 池（URL/文件/IP，逗号分隔）；为空时默认读 `./data/cfst_select/preferred_ips.txt`
-- `IP_UPDATE_MODE`：`latency` 或 `speed`，默认 `latency`
+- `IP_UPDATE_MODE`：`stable`、`latency` 或 `speed`，默认 `stable`（建议配置 DNS 三项以便读取当前解析）
 - `MAX_IPS`：最终产出的 IP 数量（代码默认 2；你也可以在 `config.txt` 里按需改大）
 - `NOTIFY_THRESHOLD`：告警阈值（默认 2）
 - `LOCAL_DATA_DIR`：本地数据目录（默认 `./data`）
@@ -202,7 +203,7 @@ node ip_sync.js
 你可以直接在青龙容器内执行（成功率最高）：
 
 ```bash
-ql repo https://github.com/lee1080/cf_auto_bestip.git "cfst_select|ip_sync" "README|LICENSE" "utils" "" "js|txt"
+ql repo https://github.com/lee1080/cf_auto_bestip.git "cfst_select|ip_sync" "README|LICENSE" "utils|config" "" "js|txt"
 ```
 
 参数含义（不同青龙版本参数个数可能不同；下面以此命令为准）：
@@ -276,12 +277,12 @@ cf_auto_bestip#https://github.com/lee1080/cf_auto_bestip.git#main#cfst_select|ip
 
 ### `data/ip_sync/`
 
-- `preferred_ips.txt` - `ip_sync.js` 最终选出的本地结果文件
+- `serving_ips.txt` - 当前在用 IP（与 DNS 同步的本地缓存，`stable` 模式优先读取）
 - `ips.txt` - `speed` 模式二阶段测速输入 IP 临时文件
 - `result.csv` - `speed` 模式二阶段 CloudflareST 原始结果
 - `gist_id.txt` - Gist ID 本地状态文件（删除后下次会新建新的 Gist）
 
-其中：`data/cfst_select/preferred_ips.txt` 是上游优选池，`data/ip_sync/preferred_ips.txt` 是下游最终结果；若本次没有可用 IP，`ip_sync.js` 会保留该文件原有内容，首次运行且无结果时则创建空文件。
+其中：`data/cfst_select/preferred_ips.txt` 是测速优选池（候选来源），`data/ip_sync/serving_ips.txt` 是当前在用 IP 缓存（与 DNS 对齐）；若本次没有可用 IP，`serving_ips.txt` 会保留原内容，首次运行且无结果时则创建空文件。
 
 ---
 

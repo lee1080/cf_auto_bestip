@@ -377,10 +377,48 @@ async function saveResults(finalResults, preferredIpCount) {
   const preferredIps = finalResults.slice(0, preferredIpCount).map(r => r.ip).join('\n');
   fs.writeFileSync(OUTPUT_PREFERRED_IP_FILE, preferredIps);
 
-  console.log(`结果文件已保存（本地存储，不再上传远程服务）：`);
+  console.log(`结果文件已保存：`);
   console.log(`- ${OUTPUT_SPEED_FILE}`);
   console.log(`- ${OUTPUT_IP_FILE}`);
   console.log(`- ${OUTPUT_PREFERRED_IP_FILE}`);
+}
+
+async function runCfstResultUpload() {
+  if (!String(process.env.IP_UPLOAD_API || '').trim()) return;
+
+  const candidates = [
+    path.join(__dirname, 'inject', 'cfst_select_upload.js'),
+    path.join('/ql/data/scripts/inject', 'cfst_select_upload.js'),
+  ];
+
+  for (const modulePath of candidates) {
+    if (!fs.existsSync(modulePath)) continue;
+    try {
+      const upload = require(modulePath);
+      if (typeof upload.uploadCfstResultFiles !== 'function') continue;
+      const uploadResult = await upload.uploadCfstResultFiles({
+        preferredIpFile: OUTPUT_PREFERRED_IP_FILE,
+        speedResultsFile: OUTPUT_SPEED_FILE,
+        validIpsFile: OUTPUT_IP_FILE,
+      });
+
+      const formatNotify = upload.formatUploadNotification;
+      if (typeof formatNotify === 'function') {
+        const notify = formatNotify(uploadResult);
+        if (notify) {
+          await sendNotification(notify.title, notify.content);
+        }
+      }
+      return;
+    } catch (error) {
+      console.warn(`[cfst upload] 上传失败: ${error.message}`);
+      return;
+    }
+  }
+
+  console.warn(
+    '[cfst upload] 未找到上传模块（仓库 inject/ 或 /ql/data/scripts/inject/），请先执行 task inject/ql-repo-after.js',
+  );
 }
 
 // ================================
@@ -453,7 +491,9 @@ async function main() {
   console.log(`\n============== 开始执行 CloudflareSpeedTest ==============`);
   console.log(`CMD: ${cfstExecutable} ${cfstArgs.join(' ')}\n`);
 
-  console.log('正在运行 CloudflareST，请稍候...');
+  console.log(
+    `正在运行 CloudflareST（共 ${uniqueCleanIps.length} 个 IP，可能需数分钟~半小时）...\n`,
+  );
   try {
     const exitCode = await spawnWithCleanOutput(CFST_PATH, cfstArgs, { cwd: DATA_DIR });
     console.log(`\nCloudflareST 执行完毕，退出码: ${exitCode}`);
@@ -478,6 +518,7 @@ async function main() {
   }
 
   await saveResults(results, config.preferred_ip_count);
+  await runCfstResultUpload();
 
   let preferredIpsContent = '';
   try {
