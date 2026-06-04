@@ -207,7 +207,7 @@ function formatGistIpContent(ips) {
 }
 
 function formatInputSourceSummary({ directCount, urlCount, fileCount }) {
-  return `📋 输入来源: 直接 IP ${directCount} 个 | 远程 URL ${urlCount} 个 | 本地文件 ${fileCount} 个`;
+  return `📋 候选池 (CF_IP_POOL) 输入: 直接 IP ${directCount} 个 | 远程 URL ${urlCount} 个 | 本地文件 ${fileCount} 个`;
 }
 
 function formatLatencySelectionSummary(selection) {
@@ -604,12 +604,32 @@ function fetchIpsFromUrl(url, options = {}) {
   });
 }
 
-function readIpsFromLocalFile(filePath) {
+function readIpsFromLocalFile(filePath, options = {}) {
+  const kind = options.kind || "pool";
   try {
-    if (!fs.existsSync(filePath)) return [];
+    if (!fs.existsSync(filePath)) {
+      if (kind === "serving") {
+        console.log(
+          `   📂 在岗 IP 缓存 (内置 serving_ips.txt): 文件不存在，将回退 Cloudflare DNS`,
+        );
+      }
+      return [];
+    }
     const data = fs.readFileSync(filePath, "utf8");
     const ips = parseIpsFromText(data);
-    console.log(`   ✅ 本地文件: ${filePath} -> ${ips.length} 个 IP`);
+    if (kind === "serving") {
+      if (ips.length === 0) {
+        console.log(
+          `   📂 在岗 IP 缓存 (内置 serving_ips.txt): ${filePath} 为空，将回退 Cloudflare DNS`,
+        );
+      } else {
+        console.log(
+          `   📂 在岗 IP 缓存 (内置 serving_ips.txt): ${filePath} -> ${ips.length} 个 IP`,
+        );
+      }
+    } else {
+      console.log(`   ✅ 候选池本地文件: ${filePath} -> ${ips.length} 个 IP`);
+    }
     return ips;
   } catch (e) {
     console.warn(`  ⚠️ 读取本地文件失败 ${filePath}: ${e.message}`);
@@ -1013,7 +1033,9 @@ async function resolveStableServingIps(config, deps = {}) {
   const localDnsCacheFile = syncDataPaths.servingIpsFile;
 
   if (fs.existsSync(localDnsCacheFile)) {
-    const ips = Array.from(new Set(readIpsFromLocalFile(localDnsCacheFile)));
+    const ips = Array.from(
+      new Set(readIpsFromLocalFile(localDnsCacheFile, { kind: "serving" })),
+    );
     if (ips.length > 0) {
       return { ips, source: "serving_ips_file" };
     }
