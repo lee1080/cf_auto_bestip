@@ -33,6 +33,7 @@
   - `data/cfst_select/valid_ips.txt`（全部达标 IP）
   - `data/cfst_select/preferred_ips.txt`（优选前 N 个 IP）
 - 🔔 支持 `sendNotify.js` 通知（若存在）
+- 📤 可选：配置 `IP_UPLOAD_API` 后，测速完成可调用外部上传模块（需自行提供实现）
 
 一句话：**负责“找出更快的 Cloudflare IP，并把结果保存到本地池”** ⚡
 
@@ -43,9 +44,9 @@
 主要职责：
 
 - 📚 从 IP 池读取候选（支持 URL、本地文件、直接 IP）
-- ⚖️ `latency` 模式：对池内全部 IP 做轻量延迟/可用性探测
+- 🛡️ `stable` 模式（默认）：每次加载 `CF_IP_POOL`；在岗 IP 优先读内置 `data/ip_sync/serving_ips.txt`，为空则读 CF DNS；淘汰不在池内的 IP 后探活补位；与 DNS 一致时跳过更新；成功后写回缓存
+- ⚖️ `latency` 模式：对候选池全部 IP 做轻量延迟/可用性探测，选最低的 N 个
 - 🚀 `speed` 模式：先做轻量探活，再仅对延迟最低的少量候选复用本地 CloudflareST 二进制测速
-- 🛡️ `stable` 模式：每次加载 `CF_IP_POOL`；在岗 IP 优先 `data/ip_sync/serving_ips.txt`（与 DNS 同步缓存），否则读 CF DNS；淘汰不在池内的 IP 后探活补位；成功运行后写回该文件
 - ☁️ 可选同步 Cloudflare DNS 解析记录（A 记录）
 - 📝 可选同步最终 IP 列表到 Gist
 - 📦 可选上传最终 IP 列表到 S3/R2 兼容对象存储
@@ -60,12 +61,20 @@
 ## 🔄 推荐运行流程
 
 1. 先跑 `cfst_select.js` 生成优选池 `data/cfst_select/preferred_ips.txt`  
-2. 再由 `ip_sync.js` 按高频周期从池中选出最终 IP 并同步输出目标
+2. 再由 `ip_sync.js` 按高频周期维护最终 IP（默认 `stable` 模式，适合每 5 分钟定时）
 
 可理解为：
 
-- `cfst_select.js` = 选手选拔赛 🏃
-- `ip_sync.js` = 从候选名单里持续选出当前最合适的上场节点 🧑‍🔧
+- `cfst_select.js` = 选手选拔赛 🏃（低频，刷新候选池）
+- `ip_sync.js` = 在岗保活 + 故障补位 🧑‍🔧（高频，`stable` 时 DNS 无变化会跳过 API 调用）
+
+`stable` / `latency` / `speed` 怎么选：
+
+| 模式 | 适用场景 | 特点 |
+| --- | --- | --- |
+| `stable`（默认） | 已配置 DNS，希望尽量少改解析 | 保留在岗 IP，只淘汰失效或不在池内的，补位到 `MAX_IPS` |
+| `latency` | 每次从池里重新挑最快的 N 个 | 全量轻量探活，可能频繁换 IP |
+| `speed` | 需要按下载速度二次筛选 | 成本最高，会调用 CloudflareST |
 
 ---
 
@@ -91,14 +100,16 @@
 - `CFST_SELECT_SPEED_TEST_URL`：CloudflareST 自定义测速地址（可选）
 - `LOCAL_DATA_DIR`：本地数据目录（默认 `./data`）
 - `github_proxy`：下载 CloudflareST 的代理前缀（可选）
+- `IP_UPLOAD_API`：可选；测速结果外部上传接口（需配合自定义上传模块）
 
 ### `ip_sync.js` 常用变量
 
-- `CF_IP_POOL`：IP 池（URL/文件/IP，逗号分隔）；为空时默认读 `./data/cfst_select/preferred_ips.txt`
+- `CF_IP_POOL`：候选 IP 池（URL/文件/IP，逗号分隔）；为空时默认读 `./data/cfst_select/preferred_ips.txt`；`stable` 模式下远程 URL 最多重试 3 次
 - `IP_UPDATE_MODE`：`stable`、`latency` 或 `speed`，默认 `stable`（建议配置 DNS 三项以便读取当前解析）
 - `MAX_IPS`：最终产出的 IP 数量（代码默认 2；你也可以在 `config.txt` 里按需改大）
 - `NOTIFY_THRESHOLD`：告警阈值（默认 2）
 - `LOCAL_DATA_DIR`：本地数据目录（默认 `./data`）
+- `data/ip_sync/serving_ips.txt`：**程序内置**在岗 IP 缓存（非配置项）；`stable` 模式优先读取，成功后写回
 - `CF_API_TOKEN` / `CF_ZONE_ID` / `CF_DOMAIN`：可选；三者都存在时才同步 DNS
 - `GITHUB_TOKEN` / `GIST_NAME`：可选；两者都存在时才同步 Gist
 - `GIST_SECRET`：是否创建 secret gist（可选；仅 `true` 视为 secret，其它值都按 public 处理）
@@ -154,6 +165,8 @@ IP_SYNC_SPEED_TEST_DURATION_S=
 IP_SYNC_SPEED_TEST_URL=
 IP_SYNC_SPEED_CANDIDATE_COUNT=
 
+IP_UPDATE_MODE=stable
+CF_IP_POOL=
 CF_API_TOKEN=your_token
 CF_ZONE_ID=your_zone_id
 CF_DOMAIN=example.com
@@ -211,7 +224,7 @@ ql repo https://github.com/lee1080/cf_auto_bestip.git "cfst_select|ip_sync" "REA
 - 仓库：`https://github.com/lee1080/cf_auto_bestip.git`
 - 白名单：`cfst_select|ip_sync`（只拉两个入口脚本，避免 `utils/shared.js` 出现在任务列表里）
 - 黑名单：`README|LICENSE`（不拉文档/协议文件）
-- 依赖文件：`utils`（把 `utils/shared.js` 作为依赖拷贝到仓库目录）
+- 依赖文件：`utils|config`（把 `utils/shared.js`、`config.example.txt` 等依赖拷贝到仓库目录）
 - 分支：留空（默认分支）
 - 文件后缀：`js|txt`（允许拉取 `.js` 和 `.txt`）
 
@@ -220,14 +233,14 @@ ql repo https://github.com/lee1080/cf_auto_bestip.git "cfst_select|ip_sync" "REA
 如果你的青龙版本支持「创建订阅 -> 名称」自动解析，可尝试：
 
 ```text
-cf_auto_bestip#https://github.com/lee1080/cf_auto_bestip.git#main#cfst_select|ip_sync#README|LICENSE#utils##js|txt
+cf_auto_bestip#https://github.com/lee1080/cf_auto_bestip.git#main#cfst_select|ip_sync#README|LICENSE#utils|config##js|txt
 ```
 
 说明（名称粘贴模式字段顺序）：
 
 - 名称#链接#分支#白名单#黑名单#（其余参数…）
-- 本示例与上面的 `ql repo` 命令保持一致：白名单 `cfst_select|ip_sync`，黑名单 `README|LICENSE`，依赖文件 `utils`，后缀 `js|txt`
-- 这样入口脚本仍然只有 `cfst_select.js` 和 `ip_sync.js`，而 `utils/shared.js` 会作为依赖文件同步，不会单独出现在任务列表中。
+- 本示例与上面的 `ql repo` 命令保持一致：白名单 `cfst_select|ip_sync`，黑名单 `README|LICENSE`，依赖文件 `utils|config`，后缀 `js|txt`
+- 这样入口脚本仍然只有 `cfst_select.js` 和 `ip_sync.js`，而 `utils/shared.js`、`config.example.txt` 会作为依赖文件同步，不会单独出现在任务列表中。
 
 若该模式仍不生效，请优先使用上面的 `ql repo` 命令方式。✅
 
@@ -247,18 +260,24 @@ cf_auto_bestip#https://github.com/lee1080/cf_auto_bestip.git#main#cfst_select|ip
 
 ### 4. 环境变量配置
 
-在青龙「环境变量」中建议至少配置以下项：
+在青龙「环境变量」或 `config.sh` 中建议至少配置以下项：
 
 - `IP_SOURCE_URL`（或 `IP_RANDOM_SOURCE_URL`）
+- `IP_UPDATE_MODE=stable`（默认即为 `stable`，可不填；需全量重选时用 `latency` / `speed`）
+- `MAX_IPS`（DNS 最终保留条数，按域名需求调整）
+- `CF_IP_POOL`（可选；留空则读 `data/cfst_select/preferred_ips.txt`）
 - 若需要 DNS 输出：`CF_API_TOKEN`、`CF_ZONE_ID`、`CF_DOMAIN`
 - 若需要 Gist 输出：`GITHUB_TOKEN`、`GIST_NAME`
+
+`stable` 模式下日志会区分 **候选池 (CF_IP_POOL)** 与 **在岗 IP 缓存 (serving_ips.txt)**，后者为程序内置文件，不是配置里的输入路径。
 
 如需使用文件配置，请在本地复制 `config.example.txt` 为 `config.txt`；`config.txt` 不应提交。✅
 
 ### 5. 运行顺序建议
 
 - 先手动执行一次 `cfst_select.js`，确认生成 `data/cfst_select/preferred_ips.txt`
-- 再执行 `ip_sync.js`，确认 DNS 可正常更新
+- 再执行 `ip_sync.js`，确认 DNS 可正常更新（`stable` 模式下若 IP 未变化，日志会提示跳过 DNS 同步）
+- 首次 `stable` 运行时若 `serving_ips.txt` 为空，会从 Cloudflare DNS 读在岗 IP 并在成功后写回缓存
 - 最后开启定时任务自动运行 🔁
 
 ---
@@ -282,7 +301,7 @@ cf_auto_bestip#https://github.com/lee1080/cf_auto_bestip.git#main#cfst_select|ip
 - `result.csv` - `speed` 模式二阶段 CloudflareST 原始结果
 - `gist_id.txt` - Gist ID 本地状态文件（删除后下次会新建新的 Gist）
 
-其中：`data/cfst_select/preferred_ips.txt` 是测速优选池（候选来源），`data/ip_sync/serving_ips.txt` 是当前在用 IP 缓存（与 DNS 对齐）；若本次没有可用 IP，`serving_ips.txt` 会保留原内容，首次运行且无结果时则创建空文件。
+其中：`data/cfst_select/preferred_ips.txt` 是测速优选池（`CF_IP_POOL` 候选来源），`data/ip_sync/serving_ips.txt` 是当前在用 IP 缓存（程序内置，`stable` 模式读写）；若本次没有可用 IP，`serving_ips.txt` 会保留原内容，首次运行且无结果时则创建空文件。
 
 ---
 
